@@ -163,20 +163,48 @@ class WaimeaWaveForecaster:
             raise RuntimeError("Model is not trained/loaded. Call fit() or load().")
 
         df = basic_time_series_clean(df)
+        asof_date = df["date"].max()
+        forecast_date = asof_date + pd.Timedelta(days=1)
+        
         spec = FeatureSpec(
             target_col=self.config.target_col,
             lags=self.config.lags,
             rolling_windows=self.config.rolling_windows,
         )
-        X, y, y_date = build_features(df, spec)
-
-        # Use the last available feature row (as-of latest date)
+        
+        # Build features - we need to manually construct features for the last row
+        # because build_features filters out rows where target is NaN (future dates)
+        d = df.copy()
+        d = d.sort_values("date").reset_index(drop=True)
+        
+        # Missing indicators for original sensor columns
+        sensor_cols = [c for c in d.columns if c != "date"]
+        for c in sensor_cols:
+            d[f"{c}__is_missing"] = d[c].isna().astype(int)
+        
+        # Lag features for all sensor columns
+        for c in sensor_cols:
+            for lag in spec.lags:
+                d[f"{c}__lag_{lag}"] = d[c].shift(lag)
+        
+        # Rolling stats for wave heights and periods
+        roll_cols = [c for c in sensor_cols if c.startswith("wave_height_") or "wave_period" in c]
+        for c in roll_cols:
+            for w in spec.rolling_windows:
+                d[f"{c}__roll_mean_{w}"] = d[c].rolling(window=w, min_periods=1).mean()
+                d[f"{c}__roll_std_{w}"] = d[c].rolling(window=w, min_periods=2).std()
+        
+        # Get feature columns (excluding date and raw target)
+        feature_cols = [c for c in d.columns if c not in ["date", spec.target_col]]
+        X = d[feature_cols]
+        
+        # Use the last row (which corresponds to asof_date) to predict the next day
         x_last = X.iloc[[-1]][self.feature_columns_]
         pred = float(self.pipeline.predict(x_last)[0])
 
         return {
-            "asof_date": str(df["date"].max().date()),
-            "forecast_for_date": str(y_date.iloc[-1].date()),
+            "asof_date": str(asof_date.date()),
+            "forecast_for_date": str(forecast_date.date()),
             "predicted_wave_height_m": pred,
             "meets_3m_threshold": bool(pred >= self.config.threshold_m),
             "threshold_m": self.config.threshold_m,
